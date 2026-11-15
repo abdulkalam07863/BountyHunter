@@ -25,7 +25,7 @@ from .util import (BANNER, make_session, project_dir, repo_stats, resolve_worksp
                    setup_logging, slugify)
 
 console = Console()
-RULES_DIR = Path(__file__).parent / "audit"
+RULES_DIR = Path(__file__).resolve().parent.parent / "rules"
 
 
 def _ctx(args):
@@ -53,6 +53,12 @@ def _tool_table(name: str, tools_report: list) -> Table:
         colour = "green" if st == "ok" else "red" if ("missing" in st or "rc=" in st or "crash" in st) else "yellow"
         t.add_row(str(t_.get("tool", "?")), f"[{colour}]{st}[/]")
     return t
+
+
+def _dead_tools(tools_report: list) -> list:
+    """Only real failures. bandit/gitleaks/npm exit 1 to mean 'found something'."""
+    return [t_.get("tool") for t_ in tools_report
+            if str(t_.get("status", "")).startswith(("rc=", "crash", "no sources"))]
 
 
 def cmd_discover(args):
@@ -128,6 +134,9 @@ def cmd_audit(args):
     db.upsert_project(p["platform"], p["slug"], stack=detect_stack(repo), status="auditing")
     audit = run_audit(cfg, repo, RULES_DIR, solidity_mode=bool(list(repo.rglob("*.sol"))))
     console.print(_tool_table(repo.name, audit["tools"]))
+    dead = _dead_tools(audit["tools"])
+    if dead:
+        console.print(f"[yellow]{', '.join(dead)} failed - findings may be incomplete[/]")
     for f in audit["findings"]:
         db.add_finding(p["id"], f)
     for t in audit["tools"]:
@@ -169,16 +178,18 @@ def cmd_target(args):
         console.print("[yellow]ETH_RPC_URL unset - PoC scaffolds will not fork[/]")
 
     root = pdir / "repo"
-    findings, cloned, scope_paths = [], [], []
+    findings, cloned, failed = [], [], []
+    repo_paths: dict = {}
     for r in scope["repos"]:
         name = r["url"].rstrip("/").split("/")[-1].removesuffix(".git")
         dest = root / name
         try:
             clone_repo(r["url"], r["branch"], dest)
             cloned.append(dest)
-            scope_paths.extend(r["paths"])
+            repo_paths[dest] = r["paths"]
         except CloneError as exc:
             console.print(f"[red]{name}: {exc}[/]")
+            failed.append(name)
 
     prior: list = []
     for dest in cloned:
@@ -189,16 +200,24 @@ def cmd_target(args):
         for a in prior[:8]:
             console.print(f"  [dim]{a}[/]")
 
+    all_tools: list = []
     for dest in cloned:
         stats = repo_stats(dest)
         console.print(f"[cyan]auditing[/] {dest.name} ({stats['files']} files)")
-        res = run_audit(cfg, dest, RULES_DIR, solidity_mode=True, scope_paths=scope_paths)
+        res = run_audit(cfg, dest, RULES_DIR, solidity_mode=True,
+                        scope_paths=repo_paths.get(dest) or None)
         console.print(_tool_table(dest.name, res["tools"]))
+        all_tools.extend(res["tools"])
+        for t_ in res["tools"]:
+            db.add_run(pid, t_.get("tool", "?"), t_.get("status", "?"))
+        dead = _dead_tools(res["tools"])
+        if dead:
+            console.print(f"[red]{dest.name}: {', '.join(dead)} failed - tree not compiled[/]")
+            failed.append(dest.name)
+            continue
         for f in res["findings"]:
             f["file"] = f"{dest.name}/{f.get('file') or ''}"
         findings.extend(res["findings"])
-        for t_ in res["tools"]:
-            db.add_run(pid, t_.get("tool", "?"), t_.get("status", "?"))
 
     findings.sort(key=lambda x: -x["cvss"])
     for f in findings:
@@ -207,23 +226,33 @@ def cmd_target(args):
     counts = {s: 0 for s in ("critical", "high", "medium", "low", "info")}
     for f in findings:
         counts[f["severity"]] += 1
-    audit = {"findings": findings, "counts": counts, "tools": []}
+    audit = {"findings": findings, "counts": counts, "tools": all_tools}
 
     for path in write_reports(p, audit, cfg, pdir, {"files": 0, "bytes": 0}, scope):
         console.print(f"[green]report ->[/] {path}")
-    if cfg.poc.get("enabled", True):
+
+    if failed:
+        console.print(f"\n[red]{len(failed)} of {len(cloned) + len(failed)} repos failed "
+                      f"- see the warnings above[/]")
+
+    if cfg.poc.get("enabled", True) and findings:
         fallback = None
         for dest in cloned:
             fallback = first_deployment_address(dest)
             if fallback:
                 break
-        for path in generate(pdir, findings, scope, fallback):
+        for path in generate(pdir, findings, scope, fallback,
+                             repo=cloned[0] if cloned else None):
             console.print(f"[green]poc ->[/] {path}")
-    db.set_status(pid, "audited")
+
+    db.set_status(pid, "error" if not findings else "audited")
 
     if counts["critical"] or counts["high"]:
         console.print(f"\n[yellow]critical {counts['critical']} / high {counts['high']} "
                       f"- validate against the live target before writing up[/]")
+
+    if not findings:
+        sys.exit(1)
 
 
 def cmd_docs(args):
@@ -254,6 +283,9 @@ def cmd_run(args):
                               stack=detect_stack(repo), status="auditing")
             audit = run_audit(cfg, repo, RULES_DIR, solidity_mode=bool(list(repo.rglob("*.sol"))))
             console.print(_tool_table(repo.name, audit["tools"]))
+            dead = _dead_tools(audit["tools"])
+            if dead:
+                console.print(f"[yellow]{p['slug']}: {', '.join(dead)} failed[/]")
             for f in audit["findings"]:
                 db.add_finding(p["id"], f)
             for path in write_reports(db.get_project(p["id"]), audit, cfg,
