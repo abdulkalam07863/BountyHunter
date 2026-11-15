@@ -35,14 +35,13 @@ def normalise(f: dict) -> dict:
 def dedupe(findings: list) -> list:
     best = {}
     for f in findings:
-        key = f"{f.get('file')}::{f.get('line')}::{(f.get('title') or '')[:40].lower()}"
+        key = f"{f.get('file')}::{f.get('tool')}::{(f.get('title') or '')[:40].lower()}"
         if key not in best or f["cvss"] > best[key]["cvss"]:
             best[key] = f
     return list(best.values())
 
 
-def cap_per_rule(findings: list, cap: int = 6) -> list:
-    """Stop one rule owning the whole report."""
+def cap_per_rule(findings: list, cap: int = 3, max_total: int = 120) -> list:
     counts: dict = {}
     out = []
     for f in findings:
@@ -50,17 +49,38 @@ def cap_per_rule(findings: list, cap: int = 6) -> list:
         counts[key] = counts.get(key, 0) + 1
         if counts[key] <= cap:
             out.append(f)
+        if len(out) >= max_total:
+            break
     return out
 
 
+def _norm_path(p: str) -> str:
+    return (p or "").replace("\\", "/").lstrip("./").strip("/")
+
+
 def in_scope(f: dict, scope_paths) -> bool:
-    """Findings carry repo-relative paths; build findings carry none."""
     if not scope_paths:
         return True
-    path = f.get("file") or ""
+    path = _norm_path(f.get("file") or "")
     if not path:
         return True
-    return any(path.startswith(p.strip("/")) for p in scope_paths)
+    for p in scope_paths:
+        p = _norm_path(p)
+        if p and (path == p or path.startswith(p + "/")):
+            return True
+    return False
+
+
+def _record(name, fut_or_result, all_findings, tool_report):
+    try:
+        found, meta = fut_or_result
+    except Exception as exc:
+        tool_report.append({"tool": name, "status": f"crash: {exc}"})
+        log.info("%s -> crash: %s", name, exc)
+        return
+    all_findings.extend(found)
+    tool_report.append(meta)
+    log.info("%s -> %d (%s)", name, len(found), meta.get("status"))
 
 
 def run_audit(cfg, repo: Path, rules_dir: Path, solidity_mode: bool = False,
@@ -68,6 +88,15 @@ def run_audit(cfg, repo: Path, rules_dir: Path, solidity_mode: bool = False,
     enabled = {k for k, v in (cfg.audit.get("tools") or {}).items() if v}
     sol_enabled = {k for k, v in (cfg.solidity.get("tools") or {}).items() if v} if solidity_mode else set()
     all_findings, tool_report = [], []
+
+    # forge build first, alone: slither's crytic_compile re-runs the build and
+    # collides with an in-flight one over the same out/ directory.
+    if "forge_build" in sol_enabled:
+        try:
+            _record("forge-build", solidity.RUNNERS["forge_build"](repo, cfg),
+                    all_findings, tool_report)
+        except Exception as exc:
+            tool_report.append({"tool": "forge-build", "status": f"crash: {exc}"})
 
     with cf.ThreadPoolExecutor(max_workers=max(1, cfg.max_concurrency)) as pool:
         futures = {}
@@ -78,19 +107,11 @@ def run_audit(cfg, repo: Path, rules_dir: Path, solidity_mode: bool = False,
                 futures[pool.submit(tools.RUNNERS[name], repo, cfg, rules_dir)] = name
             else:
                 futures[pool.submit(tools.RUNNERS[name], repo, cfg)] = name
-        for name in sol_enabled:
+        for name in sol_enabled - {"forge_build"}:
             if name in solidity.RUNNERS:
                 futures[pool.submit(solidity.RUNNERS[name], repo, cfg)] = name
         for fut in cf.as_completed(futures):
-            name = futures[fut]
-            try:
-                found, meta = fut.result()
-            except Exception as exc:
-                tool_report.append({"tool": name, "status": f"crash: {exc}"})
-                continue
-            all_findings.extend(found)
-            tool_report.append(meta)
-            log.info("%s -> %d (%s)", name, len(found), meta.get("status"))
+            _record(futures[fut], fut.result(), all_findings, tool_report)
 
     if cfg.audit.get("custom_rules", True):
         hits = scan.run_rules(repo, cfg)
@@ -108,7 +129,9 @@ def run_audit(cfg, repo: Path, rules_dir: Path, solidity_mode: bool = False,
     norm = dedupe([f for f in norm if SEVERITY_ORDER[f["severity"]] >= floor])
     norm = [f for f in norm if in_scope(f, scope_paths)]
     norm.sort(key=lambda f: (-f["cvss"], f.get("file") or "", f.get("line") or 0))
-    norm = cap_per_rule(norm)
+    norm = cap_per_rule(norm,
+                        int(cfg.audit.get("max_hits_per_rule", 3)),
+                        int(cfg.audit.get("max_total_findings", 120)))
 
     counts = {s: 0 for s in SEVERITY_ORDER}
     for f in norm:
