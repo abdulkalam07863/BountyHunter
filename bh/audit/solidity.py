@@ -9,6 +9,17 @@ from ..util import have_tool, log, run_cmd, short_hash
 SEV = {"critical": "critical", "high": "high", "medium": "medium", "low": "low",
        "informational": "info", "info": "info", "optimization": "info"}
 
+_TOML = """[profile.default]
+auto_detect_solc = true
+src = "{src}"
+out = "out"
+libs = ["lib", "node_modules"]
+skip = ["**/*.vy", "**/*.vyi"]
+optimizer = true
+optimizer_runs = 200
+evm_version = "paris"
+"""
+
 
 def _norm(s):
     return SEV.get(str(s or "").lower(), "medium")
@@ -23,23 +34,62 @@ def _f(title, sev, tool, **kw):
             "fingerprint": short_hash(f"{tool}:{kw.get('file')}:{kw.get('line')}:{title}")}
 
 
+def _rc(res) -> int:
+    """Windows reports exit 255 as 4294967295. Normalise to signed."""
+    rc = res["rc"]
+    return rc - 2 ** 32 if rc > 2 ** 31 else rc
+
+
+def ensure_foundry_config(repo: Path) -> bool:
+    """Foundry projects ship foundry.toml. Hardhat/Truffle trees do not - bridge them
+    instead of letting forge default to a src/ directory that does not exist.
+    .vy sources are skipped: no vyper toolchain is required and they sit out of scope."""
+    if (repo / "foundry.toml").is_file():
+        return True
+    src = "contracts" if (repo / "contracts").is_dir() else "src"
+    if not (repo / src).is_dir():
+        return False
+    (repo / "lib").mkdir(exist_ok=True)
+    try:
+        (repo / "foundry.toml").write_text(_TOML.format(src=src), encoding="utf-8")
+        log.info("wrote foundry.toml (src=%s) for %s", src, repo.name)
+    except OSError:
+        pass
+    return True
+
+
+def _status(res, ok_extra=False):
+    if res["ok"] or ok_extra:
+        return "ok"
+    return f"rc={_rc(res)}"
+
+
 def forge_build(repo: Path, cfg):
     if not have_tool("forge"):
         return [], {"tool": "forge-build", "status": "missing"}
+    if not ensure_foundry_config(repo):
+        return [], {"tool": "forge-build", "status": "no sources"}
     if cfg.solidity.get("install_foundry_deps", True):
-        run_cmd(["forge", "install", "foundry-rs/forge-std", "--no-commit"], cwd=repo, timeout=900)
-    res = run_cmd(["forge", "build", "--sizes"], cwd=repo, timeout=int(cfg.audit.get("tool_timeout", 1800)))
+        run_cmd(["forge", "install", "foundry-rs/forge-std", "--no-commit"],
+                cwd=repo, timeout=900)
+    res = run_cmd(["forge", "build", "--sizes"], cwd=repo,
+                  timeout=int(cfg.audit.get("tool_timeout", 1800)))
+    oversize = "exceeds the size limit" in (res["out"] + res["err"])
     findings = []
-    if not res["ok"]:
+    if not res["ok"] and not oversize:
+        log.warning("forge build failed (%s):\n%s", repo.name,
+                    (res["err"] or res["out"])[:2000])
         findings.append(_f("Compilation failure", "high", "forge-build", category="build",
                            detail=(res["err"] or res["out"])[:1500], economic=1))
-    return findings, {"tool": "forge-build", "status": "ok" if res["ok"] else f"rc={res['rc']}",
+    return findings, {"tool": "forge-build", "status": _status(res, oversize),
                       "dur": res["dur"], "err": (res["err"] or "")[:400]}
 
 
 def slither(repo: Path, cfg):
     if not have_tool("slither"):
         return [], {"tool": "slither", "status": "missing"}
+    if not ensure_foundry_config(repo):
+        return [], {"tool": "slither", "status": "no sources"}
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
         out = tf.name
     cmd = ["slither", ".", "--json", out,
@@ -64,7 +114,11 @@ def slither(repo: Path, cfg):
         log.warning("slither parse: %s", exc)
     finally:
         Path(out).unlink(missing_ok=True)
-    return findings, {"tool": "slither", "status": "ok" if res["ok"] else f"rc={res['rc']}",
+    if not res["ok"]:
+        log.warning("slither failed (%s):\n%s", repo.name, (res["err"] or res["out"])[:2000])
+    # slither exits 255 (4294967295) whenever it finds anything - a non-zero rc is
+    # not a failure once detectors came back. Only red if it produced nothing.
+    return findings, {"tool": "slither", "status": "ok" if findings else _status(res),
                       "dur": res["dur"], "err": (res["err"] or "")[:400]}
 
 
@@ -73,7 +127,8 @@ def aderyn(repo: Path, cfg):
         return [], {"tool": "aderyn", "status": "missing"}
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
         out = tf.name
-    res = run_cmd(["aderyn", "-o", out, "."], cwd=repo, timeout=int(cfg.audit.get("tool_timeout", 1800)))
+    res = run_cmd(["aderyn", "-o", out, "."], cwd=repo,
+                  timeout=int(cfg.audit.get("tool_timeout", 1800)))
     findings = []
     try:
         data = json.loads(Path(out).read_text(encoding="utf-8", errors="replace") or "{}")
@@ -88,19 +143,22 @@ def aderyn(repo: Path, cfg):
         log.warning("aderyn parse: %s", exc)
     finally:
         Path(out).unlink(missing_ok=True)
-    return findings, {"tool": "aderyn", "status": "ok", "dur": res["dur"]}
+    return findings, {"tool": "aderyn", "status": "ok" if findings else _status(res),
+                      "dur": res["dur"]}
 
 
 def mythril(repo: Path, cfg):
     if not have_tool("myth"):
         return [], {"tool": "mythril", "status": "missing"}
-    findings, dur = [], 0.0
+    findings, dur, failed = [], 0.0, 0
     for sol in list(repo.rglob("*.sol"))[:25]:
-        if any(p in {"mocks", "test", "lib"} for p in sol.parts):
+        if any(p in {"mocks", "test", "lib", "node_modules"} for p in sol.parts):
             continue
-        res = run_cmd(["myth", "analyze", str(sol), "-o", "json", "--execution-timeout", "120"],
-                      cwd=repo, timeout=400)
+        res = run_cmd(["myth", "analyze", str(sol), "-o", "json",
+                       "--execution-timeout", "120"], cwd=repo, timeout=400)
         dur += res["dur"]
+        if not res["ok"]:
+            failed += 1
         try:
             for issue in json.loads(res["out"] or "{}").get("issues", []):
                 findings.append(_f(issue.get("title", "mythril"), issue.get("severity"), "mythril",
@@ -109,13 +167,15 @@ def mythril(repo: Path, cfg):
                                    remediation=issue.get("remediation", "")))
         except Exception:
             continue
-    return findings, {"tool": "mythril", "status": "ok", "dur": round(dur, 1)}
+    status = "ok" if failed == 0 else f"partial ({failed} files failed)"
+    return findings, {"tool": "mythril", "status": status, "dur": round(dur, 1)}
 
 
 def echidna(repo: Path, cfg):
     if not have_tool("echidna"):
         return [], {"tool": "echidna", "status": "missing"}
-    contracts = [p for p in repo.rglob("*.sol") if "test" in p.name.lower()]
+    contracts = [p for p in repo.rglob("*.sol")
+                 if "test" in p.name.lower() and "lib" not in p.parts]
     if not contracts:
         return [], {"tool": "echidna", "status": "skipped: no property tests"}
     res = run_cmd(["echidna", str(contracts[0]), "--contract", contracts[0].stem,
@@ -123,7 +183,7 @@ def echidna(repo: Path, cfg):
     findings = [_f(f"Property violated: {l.strip()[:120]}", "high", "echidna",
                    category="invariant", file=contracts[0].name, detail=l.strip(), economic=3)
                 for l in res["out"].splitlines() if "failed!" in l.lower()]
-    return findings, {"tool": "echidna", "status": "ok", "dur": res["dur"]}
+    return findings, {"tool": "echidna", "status": _status(res), "dur": res["dur"]}
 
 
 RUNNERS = {"slither": slither, "aderyn": aderyn, "mythril": mythril,
